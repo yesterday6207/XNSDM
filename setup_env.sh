@@ -1,0 +1,1 @@
+src/rmtc_bot/scripts/setup_env.sh

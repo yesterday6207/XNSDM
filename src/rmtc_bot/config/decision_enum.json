@@ -1,0 +1,7 @@
+{
+  "decision_types": {
+    "stage1_collect": "第一阶段独立采集：仅 MOVE/WAIT，贪心采集已知资源并探索未知区域。",
+    "stage2_combat": "第二阶段综合策略：资源、任务点、攻击、防御与事件规避综合决策。",
+    "local_fallback": "保守本地策略：不依赖任何 AI 结果，按规则策略行动，异常时 WAIT。"
+  }
+}

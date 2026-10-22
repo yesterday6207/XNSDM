@@ -1,0 +1,14 @@
+# ROS 2 构建产物
+build/
+install/
+log/
+
+# 编辑器与缓存
+.vscode/
+__pycache__/
+*.pyc
+*.swp
+
+# 本地运行产物
+*.bag
+frames.jsonl

@@ -1,0 +1,1 @@
+src/rmtc_bot/scripts/run_contestant.sh

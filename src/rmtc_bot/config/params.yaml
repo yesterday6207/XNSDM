@@ -1,0 +1,31 @@
+stage: 2
+team: "A"
+team_name: "RMTC-Bot"
+
+ai:
+  enabled: true
+  base_url: "http://127.0.0.1:8000"
+  model: ""
+  max_tokens: 512
+  temperature: 0.2
+  request_timeout_s: 4.0
+  max_inflight: 1
+  max_calls_per_match: 40
+  min_interval_ticks: 8
+  periodic_interval_ticks: 80
+  max_event_chars: 6000
+
+planning:
+  stage2_reach_target: [12, 12]
+  low_hp_threshold: 30
+  defend_hp_threshold: 45
+  heal_hp_threshold: 70
+  reach_priority_tick: 180
+  hunt_after_tick: 330
+  hunt_memory_ticks: 30
+  patrol_interval_ticks: 50
+  stage2_total_ticks: 500
+  fortress_stay_ticks: 10
+  attack_max_range: 2
+  exploration_enabled: true
+  resource_memory_ticks: 120
