@@ -28,6 +28,13 @@ void EntityTracker::update(const Perception& perception) {
       track.defending = entity.defending;
       track.protected_ = entity.protected_;
       track.last_seen_tick = perception.tick;
+      const auto previous = enemies_.find(track.robot_id);
+      if (previous != enemies_.end()) {
+        // 位置变化即视为该敌人本 Tick 成功移动；未见位移时沿用上次记录
+        track.last_move_tick = previous->second.position != track.position
+                                   ? perception.tick
+                                   : previous->second.last_move_tick;
+      }
       enemies_[track.robot_id] = track;
     } else if (entity.type == "resource_normal" || entity.type == "resource_high") {
       seen_resource_ids.insert(entity.id);
@@ -74,6 +81,11 @@ std::vector<EnemyTrack> EntityTracker::visible_enemies(const Perception& percept
     track.defending = entity.defending;
     track.protected_ = entity.protected_;
     track.last_seen_tick = perception.tick;
+    // 补上记忆中的位移 Tick，供易伤判断使用
+    const auto tracked = enemies_.find(track.robot_id);
+    if (tracked != enemies_.end()) {
+      track.last_move_tick = tracked->second.last_move_tick;
+    }
     result.push_back(track);
   }
   return result;

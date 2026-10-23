@@ -31,8 +31,13 @@ class EventState {
   bool clean_reflect_active(int tick) const;
   bool illusion_active(int tick) const;
   bool vulnerability_active(int tick) const;
+  /// 本车是否已获得易伤（下一 Tick 战斗起生效，受普通/无双伤害 ×2）。
+  bool self_vulnerable(int tick) const;
+  /// 某个实体在 move_tick 移动后是否会在 tick 处于易伤（用于判断可见敌人）。
+  bool moved_in_panpan_window(int move_tick, int tick) const;
   bool is_cell_blocked(const Cell& cell, int tick) const;
-  bool is_cell_risky(const Cell& cell, int tick, double hp) const;
+  /// protected_self 为真时出生保护免疫爆炸等环境伤害，不必为危险格放弃输出。
+  bool is_cell_risky(const Cell& cell, int tick, bool protected_self = false) const;
   std::optional<Cell> healing_point(const Cell& self_pos, int tick, double hp) const;
   std::optional<Cell> fortress_center(int tick) const;
   /// 该格是否位于当前生效的天下无双堡垒（3×3）内。
@@ -46,6 +51,9 @@ class EventState {
   /// 记录最近一次实际发出的移动方向，用于避免相邻两格之间来回振荡。
   void note_move(int tick, const std::string& direction);
   std::optional<std::string> last_move_direction(int tick, int max_age = 2) const;
+  /// 记录本 Tick 所在格，用于巡逻时避开刚走过的区域（防止小范围绕圈）。
+  void note_visited(int tick, const Cell& cell);
+  bool recently_visited(const Cell& cell, int tick, int max_age) const;
   std::string describe() const;
 
   std::vector<TimedEvent> events;
@@ -58,6 +66,9 @@ class EventState {
   int fortress_last_tick_ = -1;
   int move_tick_ = -1;
   std::string move_direction_;
+  int vulnerable_from_ = -1;
+  int vulnerable_until_ = -1;
+  std::vector<std::pair<int, Cell>> visited_;
 };
 
 }  // namespace rmtc_bot

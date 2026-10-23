@@ -10,6 +10,7 @@
 #include "rmtc_bot/perception/entity_tracker.hpp"
 #include "rmtc_bot/perception/state_store.hpp"
 #include "rmtc_bot/planning/grid_map.hpp"
+#include "rmtc_bot/planning/path_planner.hpp"
 #include "rmtc_bot/utils/config_loader.hpp"
 
 namespace {
@@ -90,6 +91,40 @@ struct TacticsFixture {
     entity.type = "obstacle";
     entity.position = position;
     perception.entities.push_back(entity);
+  }
+
+  void add_event(const std::string& type, int from_tick, int until_tick) {
+    rmtc_bot::TimedEvent event;
+    event.type = type;
+    event.active_from = from_tick;
+    event.active_until = until_tick;
+    events.events.push_back(event);
+  }
+
+  void add_panpan(int from_tick, int until_tick) {
+    add_event("panpan", from_tick, until_tick);
+  }
+
+  void add_clean(int from_tick, int until_tick) {
+    add_event("clean", from_tick, until_tick);
+  }
+
+  void add_world_split(const Cell& crossing, int from_tick, int until_tick) {
+    rmtc_bot::TimedEvent event;
+    event.type = "world_split";
+    event.active_from = from_tick;
+    event.active_until = until_tick;
+    event.point = crossing;
+    events.events.push_back(event);
+  }
+
+  void add_explosion(const rmtc_bot::Area& area, int from_tick, int until_tick) {
+    rmtc_bot::TimedEvent event;
+    event.type = "explosion";
+    event.active_from = from_tick;
+    event.active_until = until_tick;
+    event.area = area;
+    events.events.push_back(event);
   }
 
   void start_fortress(int from_tick, int until_tick) {
@@ -644,4 +679,169 @@ TEST(Stage2Tactics, LlmDefendAvoidsChasingStaleEnemy) {
   const Intent intent = rmtc_bot::stage2_decide(fixture.context());
   EXPECT_EQ(intent.reason.find("stage2_hunt_last_seen"), std::string::npos);
   EXPECT_NE(intent.action, "wait");
+}
+
+TEST(Stage2Tactics, DoesNotTradeKillForDeath) {
+  // 击杀奖励 60 与死亡扣除 60 相抵，但还要等 3 Tick 复活并丢掉后续输出，
+  // 因此能防御保命时不主动换命。
+  TacticsFixture fixture;
+  fixture.perception.self.hp = 15.0;
+  fixture.add_robot("B", Cell{13, 12}, 15.0);
+  fixture.advance_to(10);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(intent.action, "defend");
+  EXPECT_NE(intent.reason.find("stage2_defend_lethal"), std::string::npos);
+}
+
+TEST(Stage2Tactics, VulnerableSelfDefendsBeforeLethalHit) {
+  // 潘潘的神易伤：同样 35 HP，未易伤时吃一次 20 不会死可继续输出；
+  // 已易伤时下一次普通攻击是 40 HP，必须优先防御保命。
+  TacticsFixture fixture;
+  fixture.add_panpan(10, 40);
+  fixture.events.note_move(10, "right");
+  fixture.perception.self.hp = 35.0;
+  fixture.add_robot("B", Cell{14, 12}, 100.0);
+  fixture.advance_to(11);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(intent.action, "defend");
+  EXPECT_NE(intent.reason.find("stage2_defend_lethal"), std::string::npos);
+
+  // 没有易伤时同一血量应继续输出
+  TacticsFixture baseline;
+  baseline.perception.self.hp = 35.0;
+  baseline.add_robot("B", Cell{14, 12}, 100.0);
+  baseline.advance_to(11);
+  const Intent calm = rmtc_bot::stage2_decide(baseline.context());
+  EXPECT_EQ(calm.action, "attack");
+}
+
+TEST(Stage2Tactics, PurityEventSkipsDefendingTarget) {
+  // 洁身自好：攻击防御中的敌人不会造成伤害，还会自承反伤
+  TacticsFixture fixture;
+  fixture.add_clean(10, 30);
+  fixture.add_robot("B", Cell{13, 12}, 100.0, true);
+  fixture.advance_to(12);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_NE(intent.action, "attack");
+}
+
+TEST(Stage2Tactics, EnemyVulnerabilityEnablesKill) {
+  // 敌人在潘潘的神触发窗口内移动过，下一 Tick 起受到 ×2 伤害：
+  // 30 HP 的目标平时一次 20 打不掉，易伤时可一击击杀。
+  TacticsFixture fixture;
+  fixture.add_panpan(10, 40);
+  fixture.add_robot("B", Cell{15, 12}, 30.0);
+  fixture.advance_to(10);
+  fixture.perception.entities.clear();
+  fixture.add_robot("B", Cell{14, 12}, 30.0);
+  fixture.advance_to(11);
+  fixture.perception.entities.clear();
+  fixture.add_robot("B", Cell{14, 12}, 30.0);
+  fixture.advance_to(12);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(intent.action, "attack");
+  EXPECT_NE(intent.reason.find("stage2_attack:B"), std::string::npos);
+
+  TacticsFixture baseline;
+  baseline.add_robot("B", Cell{15, 12}, 30.0);
+  baseline.advance_to(10);
+  baseline.perception.entities.clear();
+  baseline.add_robot("B", Cell{14, 12}, 30.0);
+  baseline.advance_to(11);
+  baseline.perception.entities.clear();
+  baseline.add_robot("B", Cell{14, 12}, 30.0);
+  baseline.advance_to(12);
+  const Intent calm = rmtc_bot::stage2_decide(baseline.context());
+  EXPECT_NE(calm.action, "attack");
+}
+
+TEST(Stage2Tactics, ProtectedSelfCannotAttack) {
+  // 复活出生保护期间不能 ATTACK，应改用移动继续抢节奏
+  TacticsFixture fixture;
+  fixture.perception.self.protected_ = true;
+  fixture.perception.self.position = Cell{2, 2};
+  fixture.add_resource("normal1", Cell{6, 2}, 10);
+  fixture.add_robot("B", Cell{3, 2}, 100.0);
+  fixture.advance_to(10);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_NE(intent.action, "attack");
+}
+
+TEST(Stage2Tactics, SwitchesToHuntOnceEconomyIsDone) {
+  // 任务全完成且资源分已拿满后，早期也应主动输出，而不是继续探索
+  TacticsFixture fixture;
+  fixture.see_everything();
+  fixture.perception.missions = {
+      rmtc_bot::Mission{"collect_two_normal", "normal_resources", 2.0, std::nullopt},
+      rmtc_bot::Mission{"collect_high", "high_resources", 1.0, std::nullopt},
+      rmtc_bot::Mission{"reach_target", "reach", std::nullopt, Cell{9, 9}},
+  };
+  fixture.perception.score.mission_completed_ids = {"collect_two_normal", "collect_high",
+                                                    "reach_target"};
+  fixture.perception.score.resource_value = 120.0;
+  fixture.add_robot("B", Cell{16, 12}, 100.0);
+  fixture.advance_to(100);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(intent.action, "move");
+  ASSERT_TRUE(intent.direction.has_value());
+  EXPECT_EQ(*intent.direction, "right");
+  EXPECT_NE(intent.reason.find("stage2_hunt:B"), std::string::npos);
+}
+
+TEST(Stage2Tactics, LeavesWorldSplitLineBeforeItActivates) {
+  // 世界分裂会直接击毁十字线上的战车并扣 60 有效伤害；公告后必须提前离开整行整列
+  TacticsFixture fixture;
+  fixture.add_world_split(Cell{12, 8}, 140, 150);
+  fixture.advance_to(138);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(intent.action, "move");
+  ASSERT_TRUE(intent.direction.has_value());
+  EXPECT_EQ(*intent.direction, "left");
+}
+
+TEST(Stage2Tactics, DoesNotStepOntoWorldSplitLine) {
+  TacticsFixture fixture;
+  fixture.see_everything();
+  fixture.perception.self.position = Cell{12, 10};
+  fixture.add_world_split(Cell{12, 8}, 140, 150);
+  fixture.advance_to(138);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(intent.action, "move");
+  ASSERT_TRUE(intent.direction.has_value());
+  EXPECT_NE(*intent.direction, "up");
+}
+
+TEST(Stage2Tactics, SpawnProtectionIgnoresExplosionArea) {
+  // 出生保护免疫爆炸：保护期内不必为了躲避爆炸矩形放弃输出机会
+  TacticsFixture fixture;
+  fixture.perception.self.protected_ = true;
+  fixture.add_explosion(rmtc_bot::Area{11, 11, 13, 13}, 140, 141);
+  fixture.add_robot("B", Cell{13, 12}, 100.0);
+  fixture.advance_to(139);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(intent.reason.find("stage2_escape_hazard"), std::string::npos);
+}
+
+TEST(Stage2Tactics, PatrolDoesNotLoopInSmallArea) {
+  // 旧逻辑只禁止原路折返，仍会在四格之间循环；加入轨迹禁入后应持续走出新格
+  TacticsFixture fixture;
+  fixture.see_everything();
+  fixture.perception.self.position = Cell{8, 8};
+  rmtc_bot::CellSet visited;
+  rmtc_bot::Cell pos = fixture.perception.self.position;
+  for (int tick = 470; tick < 482; ++tick) {
+    fixture.perception.self.position = pos;
+    fixture.advance_to(tick);
+    const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+    ASSERT_EQ(intent.action, "move") << "tick=" << tick;
+    ASSERT_TRUE(intent.direction.has_value()) << "tick=" << tick;
+    for (const auto& direction : rmtc_bot::kDirections) {
+      if (direction.name == *intent.direction) {
+        pos = rmtc_bot::move_cell(pos, direction.name);
+        break;
+      }
+    }
+    visited.insert(pos);
+  }
+  EXPECT_GE(visited.size(), 8u);
 }

@@ -17,6 +17,8 @@ struct EnemyTrack {
   bool defending = false;
   bool protected_ = false;
   int last_seen_tick = 0;
+  /// 最近一次观察到该敌人位移的 Tick（-1 表示未知）；用于判断潘潘的神易伤。
+  int last_move_tick = -1;
 };
 
 struct ResourceTrack {

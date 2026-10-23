@@ -33,6 +33,13 @@ constexpr double kLlmHealBonus = 15.0;
 constexpr double kEarlyTradeHp = 70.0;
 /// 撤离时把最近见过的敌人也当作威胁，避免离开视野后立刻折返。
 constexpr int kThreatMemoryTicks = 6;
+/// 普通攻击单次伤害；潘潘的神易伤期间翻倍，防御时减半。
+constexpr double kNormalHit = 20.0;
+constexpr double kVulnerableHit = 40.0;
+/// 巡逻避开最近该 Tick 数内走过的格，防止在几格之间循环空耗输出机会。
+constexpr int kPatrolTabuTicks = 24;
+/// 资源计分满分门槛：资源价值达到该值后继续采集不再加分。
+constexpr double kResourceScoreFullValue = 120.0;
 
 std::optional<Cell> reach_target(const DecisionContext& ctx) {
   return ctx.missions.reach_target(ctx.planning.stage2_reach_target);
@@ -154,7 +161,7 @@ std::optional<Intent> last_resort_move(const DecisionContext& ctx, const CellSet
     if (extra.count(cell) > 0) {
       continue;
     }
-    if (!ctx.events.is_cell_risky(cell, ctx.tick, ctx.state.hp)) {
+    if (!ctx.events.is_cell_risky(cell, ctx.tick, ctx.state.protected_)) {
       return Intent("move", std::string(direction.name), "stage2_step");
     }
     if (!risky_direction.has_value()) {
@@ -260,6 +267,17 @@ std::optional<std::string> step_toward(const DecisionContext& ctx, const Cell& g
                         extra);
 }
 
+/// 敌人是否处于潘潘的神易伤：事件触发窗口内观察到它成功移动过。
+bool enemy_vulnerable(const DecisionContext& ctx, const EnemyTrack& enemy) {
+  return ctx.events.moved_in_panpan_window(enemy.last_move_tick, ctx.tick);
+}
+
+/// 一次普通攻击对该敌人的实际伤害。
+int damage_against(const DecisionContext& ctx, const EnemyTrack& target) {
+  return normal_damage(target.defending, target.protected_,
+                       enemy_vulnerable(ctx, target));
+}
+
 /// 追击：先接近当前可见敌人；allow_memory 时才追最近见过的敌人位置。
 /// 早期不追记忆点，避免为了旧目标放弃资源搜索。
 std::optional<Intent> chase_step(const DecisionContext& ctx,
@@ -276,8 +294,14 @@ std::optional<Intent> chase_step(const DecisionContext& ctx,
       visible.push_back(&enemy);
     }
   }
+  // 击杀奖励 60 相当于三次普通命中，优先追击一次即可击毁的目标
   std::sort(visible.begin(), visible.end(),
-            [&pos](const EnemyTrack* lhs, const EnemyTrack* rhs) {
+            [&pos, &ctx](const EnemyTrack* lhs, const EnemyTrack* rhs) {
+              const bool lhs_kill = lhs->hp <= static_cast<double>(damage_against(ctx, *lhs));
+              const bool rhs_kill = rhs->hp <= static_cast<double>(damage_against(ctx, *rhs));
+              if (lhs_kill != rhs_kill) {
+                return lhs_kill;
+              }
               return manhattan(pos, lhs->position) < manhattan(pos, rhs->position);
             });
 
@@ -319,11 +343,12 @@ std::optional<Intent> chase_step(const DecisionContext& ctx,
   return std::nullopt;
 }
 
-/// 本 Tick 能在横纵直线 1~max_range 格内攻击到自己的敌人数（含保护中的敌人）。
+/// 本 Tick 能在横纵直线 1~max_range 格内攻击到自己的敌人数。
+/// 出生保护中的敌人按规则不能 ATTACK，不计入威胁。
 int line_attackers(const Cell& pos, const std::vector<EnemyTrack>& enemies, int max_range) {
   int count = 0;
   for (const auto& enemy : enemies) {
-    if (enemy.hp <= 0) {
+    if (enemy.hp <= 0 || enemy.protected_) {
       continue;
     }
     const int dx = std::abs(enemy.position.first - pos.first);
@@ -428,6 +453,7 @@ std::optional<Intent> patrol_step(const DecisionContext& ctx, const BlockedFn& b
     return std::nullopt;
   }
   std::optional<std::string> forward;
+  std::optional<std::string> fresh;   // 最近没走过的前进方向
   std::optional<std::string> backward;
   for (const auto& direction : kDirections) {
     const Cell cell = move_cell(pos, direction.name);
@@ -440,10 +466,19 @@ std::optional<Intent> patrol_step(const DecisionContext& ctx, const BlockedFn& b
     }
     if (!reverse.empty() && direction.name == reverse) {
       backward = std::string(direction.name);
-    } else {
+      continue;
+    }
+    if (!forward.has_value()) {
       forward = std::string(direction.name);
+    }
+    if (!ctx.events.recently_visited(cell, ctx.tick, kPatrolTabuTicks)) {
+      fresh = std::string(direction.name);
       break;
     }
+  }
+  // 优先没走过的格：只靠“禁止原路折返”仍会在四格之间循环
+  if (fresh.has_value()) {
+    return Intent("move", *fresh, "stage2_patrol");
   }
   if (forward.has_value()) {
     return Intent("move", *forward, "stage2_patrol");
@@ -461,9 +496,14 @@ std::optional<Intent> duel_attack(const DecisionContext& ctx,
       !ctx.state.can_attack(ctx.stage)) {
     return std::nullopt;
   }
+  // 洁身自好：攻击防御中的敌人会反伤且无收益，无双攻击也应跳过该目标
+  const bool reflect = ctx.events.clean_reflect_active(ctx.tick);
   const EnemyTrack* best = nullptr;
   for (const auto& enemy : enemies) {
     if (enemy.hp <= 0 || enemy.protected_) {
+      continue;
+    }
+    if (reflect && enemy.defending) {
       continue;
     }
     if (chebyshev(enemy.position, ctx.state.position) > 2) {
@@ -517,25 +557,43 @@ Intent decide_stage2(const DecisionContext& ctx) {
   const bool llm_heal = strategy == "heal";
   const bool llm_fortress = strategy == "fortress";
 
-  const double low_hp = ctx.planning.low_hp_threshold;
   const double heal_hp =
       ctx.planning.heal_hp_threshold + (llm_heal ? kLlmHealBonus : 0.0);
   const int hunt_start =
       std::max(0, ctx.planning.hunt_after_tick - (llm_fight ? kLlmEarlyHunt : 0) +
                       (llm_collect ? kLlmLateHunt : 0));
-  const bool late_phase = tick >= hunt_start;
+  // 任务全部完成且资源分已拿满（资源计分门槛 120）后，经济收益归零，立即转入输出期：
+  // 对抗分满分门槛为 500 有效伤害，早一步开打就多一点累计
+  const bool missions_done = !ctx.missions.needs("normal_resources") &&
+                             !ctx.missions.needs("high_resources") &&
+                             !ctx.missions.needs("reach");
+  const bool economy_done = missions_done &&
+                            ctx.state.score.resource_value >= kResourceScoreFullValue;
+  const bool late_phase = tick >= hunt_start || economy_done;
   const int late_pickup = llm_collect ? kLlmLatePickupDistance : kLatePickupDistance;
 
   double defend_hp = ctx.planning.defend_hp_threshold + (llm_defend ? kLlmDefendBonus : 0.0);
-  const bool vulnerable = ctx.events.vulnerability_active(tick);
-  if (vulnerable) {
+  // 潘潘的神易伤：自身受到普通攻击 40 HP、防御时 20 HP，需更早转入防御/撤离
+  const bool self_vulnerable = ctx.events.self_vulnerable(tick);
+  if (self_vulnerable) {
     defend_hp += 15;
   }
+  const double incoming_hit = self_vulnerable ? kVulnerableHit : kNormalHit;
+  const double incoming_defend = incoming_hit / 2.0;
 
   const auto enemies = ctx.tracker.visible_enemies(ctx.perception);
-  // 撤离判断使用“视野内 + 最近见过”的敌人：只靠当前视野会在视距边界来回折返
-  std::vector<EnemyTrack> threat_source = enemies;
+  // 撤离判断使用“视野内 + 最近见过”的敌人：只靠当前视野会在视距边界来回折返。
+  // 出生保护中的敌人不能攻击，不构成威胁，避免为免伤误判而放弃输出。
+  std::vector<EnemyTrack> threat_source;
+  for (const auto& enemy : enemies) {
+    if (!enemy.protected_) {
+      threat_source.push_back(enemy);
+    }
+  }
   for (const auto& remembered : ctx.tracker.remembered_enemies(tick, kThreatMemoryTicks)) {
+    if (remembered.protected_) {
+      continue;
+    }
     const bool still_visible =
         std::any_of(enemies.begin(), enemies.end(), [&remembered](const EnemyTrack& enemy) {
           return enemy.robot_id == remembered.robot_id;
@@ -545,7 +603,9 @@ Intent decide_stage2(const DecisionContext& ctx) {
     }
   }
   const auto threat = enemies_within(pos, threat_source, 2);
-  const bool risky_here = ctx.events.is_cell_risky(pos, tick, hp);
+  const bool risky_here = ctx.events.is_cell_risky(pos, tick, state.protected_);
+  // 记录轨迹：巡逻时避开刚走过的格，防止在几格之间绕圈空耗 Tick
+  ctx.events.note_visited(tick, pos);
 
   // 堡垒驻留必须在任何分支返回前更新，否则连续计数会被打断。
   const auto fortress = ctx.events.fortress_center(tick);
@@ -563,7 +623,7 @@ Intent decide_stage2(const DecisionContext& ctx) {
     if (ctx.events.is_cell_blocked(cell, tick)) {
       return true;
     }
-    return ctx.events.is_cell_risky(cell, tick, hp);
+    return ctx.events.is_cell_risky(cell, tick, ctx.state.protected_);
   };
 
   CellSet extra;
@@ -593,24 +653,33 @@ Intent decide_stage2(const DecisionContext& ctx) {
     return *duel;
   }
 
-  // 2. 攻击：斩杀必打；后期血量尚可持续输出；前期只处理贴脸威胁
+  // 2. 攻击：斩杀必打；后期血量尚可持续输出；前期只处理贴脸威胁。
+  //    每次死亡扣 60 有效伤害并等待 3 Tick，因此不为一次击杀主动送命。
   const auto attack = best_attack(pos, enemies, tick, &ctx.events, max_range);
   const int attackers = line_attackers(pos, enemies, max_range);
+  const bool can_defend = state.can_defend(ctx.stage);
+  // 本 Tick 同线敌人的总伤害（易伤时每次 40，防御减半）
+  const double hit = incoming_hit * std::max(1, attackers);
+  const double hit_defending = incoming_defend * std::max(1, attackers);
+  const bool lethal_standing = attackers > 0 && hp <= hit;
+  const bool lethal_defending = attackers > 0 && hp <= hit_defending;
   if (attack.has_value() && state.can_attack(ctx.stage)) {
-    const int damage =
-        normal_damage(attack->target.defending, attack->target.protected_, vulnerable);
-    if (attack->target.hp <= static_cast<double>(damage)) {
+    const int damage = damage_against(ctx, attack->target);
+    const bool kill = attack->target.hp <= static_cast<double>(damage);
+    // 击杀值得打，但若站着必死而防御能活，就不要用一次击杀换掉复活等待
+    if (kill && (!lethal_standing || !can_defend || lethal_defending)) {
       return Intent("attack", attack->direction,
                     "stage2_attack:" + attack->target.robot_id);
     }
   }
   // 被两路以上同时锁定时，低血先防御把本 Tick 伤害减半，避免做亏本换血
-  if (attackers >= 2 && hp <= defend_hp + 15.0 && state.can_defend(ctx.stage)) {
+  if (attackers >= 2 && hp <= defend_hp + 15.0 && can_defend) {
     return Intent("defend", std::nullopt, "stage2_defend_focus");
   }
   if (attack.has_value() && state.can_attack(ctx.stage)) {
+    const bool safe_to_trade = hp > incoming_hit;
     const bool healthy = hp > (late_phase ? defend_hp : kEarlyTradeHp);
-    const bool late_aggressive = late_phase && hp > low_hp;
+    const bool late_aggressive = late_phase && safe_to_trade;
     const bool early_self_defense = !late_phase && attack->distance <= 1;
     if (late_aggressive || (healthy && early_self_defense)) {
       return Intent("attack", attack->direction,
@@ -621,16 +690,12 @@ Intent decide_stage2(const DecisionContext& ctx) {
   // 3. 低血生存：攻击先于移动结算；已在射程内时换血比后撤更划算
   //    （后撤这 Tick 仍会吃满同一次伤害，还丢掉一次输出）
   if (hp <= defend_hp && !threat.empty()) {
-    const bool can_defend = state.can_defend(ctx.stage);
     if (attackers > 0) {
-      const double hit = 20.0 * attackers;
-      const double hit_defending = 10.0 * attackers;
-      const bool lethal_standing = hp <= hit;
-      const bool lethal_defending = hp <= hit_defending;
       if (attack.has_value() && state.can_attack(ctx.stage)) {
-        const int damage =
-            normal_damage(attack->target.defending, attack->target.protected_, vulnerable);
-        if (attack->target.hp <= static_cast<double>(damage) || !lethal_standing) {
+        const int damage = damage_against(ctx, attack->target);
+        const bool kill = attack->target.hp <= static_cast<double>(damage);
+        // 不会被击毁就继续输出；必死且防御也救不回来时，用一次击杀换命
+        if (!lethal_standing || (kill && (!can_defend || lethal_defending))) {
           return Intent("attack", attack->direction,
                         "stage2_attack:" + attack->target.robot_id);
         }

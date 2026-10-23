@@ -23,6 +23,20 @@ bool area_contains(const std::optional<Area>& area, const Cell& cell) {
          cell.second <= area->y2;
 }
 
+/// 潘潘的神触发窗口占事件时长的比例；正式规则为前 20/30 Tick。
+constexpr int kPanpanTriggerNumerator = 2;
+constexpr int kPanpanTriggerDenominator = 3;
+
+/// 事件前段“移动即获得易伤”的截止 Tick（不含）。
+int panpan_move_window_end(const TimedEvent& event) {
+  if (!event.active_from.has_value() || !event.active_until.has_value()) {
+    return -1;
+  }
+  const int duration = std::max(1, *event.active_until - *event.active_from);
+  return *event.active_from + std::max(
+      1, duration * kPanpanTriggerNumerator / kPanpanTriggerDenominator);
+}
+
 bool same_event(const TimedEvent& lhs, const TimedEvent& rhs) {
   return lhs.type == rhs.type && lhs.active_from == rhs.active_from &&
          lhs.active_until == rhs.active_until && lhs.area == rhs.area &&
@@ -42,6 +56,9 @@ void EventState::reset() {
   fortress_last_tick_ = -1;
   move_tick_ = -1;
   move_direction_.clear();
+  vulnerable_from_ = -1;
+  vulnerable_until_ = -1;
+  visited_.clear();
 }
 
 void EventState::apply(const LLMDecision& decision, int now_tick, GridMap* grid_map) {
@@ -128,6 +145,31 @@ bool EventState::vulnerability_active(int tick) const {
   return false;
 }
 
+bool EventState::self_vulnerable(int tick) const {
+  return vulnerable_until_ >= 0 && vulnerable_from_ >= 0 && tick >= vulnerable_from_ &&
+         tick < vulnerable_until_;
+}
+
+bool EventState::moved_in_panpan_window(int move_tick, int tick) const {
+  if (move_tick < 0 || move_tick >= tick) {
+    return false;
+  }
+  for (const auto& event : events) {
+    if (event.type != "panpan" || !event.active_from.has_value() ||
+        !event.active_until.has_value()) {
+      continue;
+    }
+    if (tick >= *event.active_until) {
+      continue;
+    }
+    const int window_end = panpan_move_window_end(event);
+    if (window_end >= 0 && move_tick >= *event.active_from && move_tick < window_end) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool EventState::is_cell_blocked(const Cell& cell, int tick) const {
   for (const auto& event : events) {
     if (event.type != "world_split" || !event.point.has_value()) {
@@ -146,10 +188,15 @@ bool EventState::is_cell_blocked(const Cell& cell, int tick) const {
   return false;
 }
 
-bool EventState::is_cell_risky(const Cell& cell, int tick, double hp) const {
+bool EventState::is_cell_risky(const Cell& cell, int tick, bool protected_self) const {
+  // 出生保护免疫爆炸/辣椒等环境伤害，此时不必为回避危险格放弃输出机会
+  const bool environment_safe = protected_self;
   for (const auto& event : events) {
     if (event.type == "explosion") {
       if (!event.active_from.has_value() || !event.active_until.has_value()) {
+        continue;
+      }
+      if (environment_safe) {
         continue;
       }
       const int delta = *event.active_from - tick;
@@ -159,7 +206,8 @@ bool EventState::is_cell_risky(const Cell& cell, int tick, double hp) const {
       if (*event.active_until <= tick) {
         continue;
       }
-      if (hp <= 80 && area_contains(event.area, cell)) {
+      // 正式规则爆炸一次 80 HP 且无视防御：任何血量进入矩形都是重亏，一律避让
+      if (area_contains(event.area, cell)) {
         return true;
       }
     }
@@ -167,7 +215,9 @@ bool EventState::is_cell_risky(const Cell& cell, int tick, double hp) const {
       if (!event.point.has_value() || !event.active_from.has_value()) {
         continue;
       }
-      if (tick + 1 == *event.active_from &&
+      // 世界分裂会直接击毁线上的战车：公告后提前 2 Tick 就避开整行整列
+      const int delta = *event.active_from - tick;
+      if (0 <= delta && delta <= 2 &&
           (cell.first == event.point->first || cell.second == event.point->second)) {
         return true;
       }
@@ -261,6 +311,18 @@ std::string EventState::strategy_hint(int tick) const {
 void EventState::note_move(int tick, const std::string& direction) {
   move_tick_ = tick;
   move_direction_ = direction;
+  // 潘潘的神：触发窗口内的成功移动会在下一 Tick 获得易伤，持续到事件统一到期。
+  for (const auto& event : events) {
+    if (event.type != "panpan" || !event.active_until.has_value()) {
+      continue;
+    }
+    const int window_end = panpan_move_window_end(event);
+    if (window_end < 0 || tick < *event.active_from || tick >= window_end) {
+      continue;
+    }
+    vulnerable_from_ = tick + 1;
+    vulnerable_until_ = *event.active_until;
+  }
 }
 
 std::optional<std::string> EventState::last_move_direction(int tick, int max_age) const {
@@ -271,6 +333,27 @@ std::optional<std::string> EventState::last_move_direction(int tick, int max_age
     return std::nullopt;
   }
   return move_direction_;
+}
+
+void EventState::note_visited(int tick, const Cell& cell) {
+  if (!visited_.empty() && visited_.back().first == tick && visited_.back().second == cell) {
+    return;
+  }
+  visited_.emplace_back(tick, cell);
+  // 只保留最近一段时间的轨迹，避免状态无界增长
+  constexpr int kKeepTicks = 64;
+  visited_.erase(std::remove_if(visited_.begin(), visited_.end(),
+                                [tick](const std::pair<int, Cell>& entry) {
+                                  return tick - entry.first > kKeepTicks;
+                                }),
+                 visited_.end());
+}
+
+bool EventState::recently_visited(const Cell& cell, int tick, int max_age) const {
+  return std::any_of(visited_.begin(), visited_.end(),
+                     [&cell, tick, max_age](const std::pair<int, Cell>& entry) {
+                       return entry.second == cell && tick - entry.first <= max_age;
+                     });
 }
 
 std::string EventState::describe() const {

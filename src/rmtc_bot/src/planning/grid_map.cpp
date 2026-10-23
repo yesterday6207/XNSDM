@@ -6,9 +6,9 @@ namespace rmtc_bot {
 
 namespace {
 
-/// 障碍记忆上限：世界分裂等临时障碍只存在十余 Tick，
-/// 离开视野后按该上限过期，避免把临时十字当成永久墙把自身封死。
-constexpr int kObstacleMemoryTicks = 20;
+/// 障碍记忆上限：世界分裂临时十字墙最长存在 30 Tick，
+/// 离开视野后按该上限过期，既记住仍在生效的墙，又不会把临时墙当成永久障碍封死路线。
+constexpr int kObstacleMemoryTicks = 40;
 
 }  // namespace
 

@@ -132,15 +132,19 @@ TEST(GridMap, StaleObstacleExpiresOutsideVision) {
   grid.update_from_perception(perception);
   EXPECT_TRUE(grid.is_blocked(Cell{0, 0}, 100));
 
-  // 视野外保留记忆，但超过记忆窗口后不再阻挡
+  // 视野外保留记忆（覆盖世界分裂 30 Tick 的临时十字墙），但超过记忆窗口后不再阻挡
   perception.tick = 115;
   perception.entities.clear();
   grid.update_from_perception(perception);
   EXPECT_TRUE(grid.is_blocked(Cell{0, 0}, 115));
 
-  perception.tick = 125;
+  perception.tick = 135;
   grid.update_from_perception(perception);
-  EXPECT_FALSE(grid.is_blocked(Cell{0, 0}, 125));
+  EXPECT_TRUE(grid.is_blocked(Cell{0, 0}, 135));
+
+  perception.tick = 146;
+  grid.update_from_perception(perception);
+  EXPECT_FALSE(grid.is_blocked(Cell{0, 0}, 146));
 }
 
 TEST(GridMap, TempBlockedExpires) {
