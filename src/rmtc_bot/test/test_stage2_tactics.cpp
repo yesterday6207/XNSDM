@@ -172,7 +172,8 @@ TEST(Stage2Tactics, LatePhaseHuntsRememberedEnemyWhenOutOfSight) {
   EXPECT_NE(intent.reason.find("stage2_hunt_last_seen"), std::string::npos);
 }
 
-TEST(Stage2Tactics, EarlyPhaseExploresInsteadOfChasingStaleTarget) {
+TEST(Stage2Tactics, EarlyPhaseHuntsRememberedEnemyInsteadOfWandering) {
+  // 前期没有资源可抢时优先主动接敌，而不是在场地中间来回巡逻空耗 Tick
   TacticsFixture fixture;
   fixture.add_robot("B", Cell{16, 12}, 100.0);
   fixture.advance_to(10);
@@ -180,8 +181,7 @@ TEST(Stage2Tactics, EarlyPhaseExploresInsteadOfChasingStaleTarget) {
   fixture.advance_to(20);
   const Intent intent = rmtc_bot::stage2_decide(fixture.context());
   EXPECT_EQ(intent.action, "move");
-  EXPECT_EQ(intent.reason.find("stage2_hunt_last_seen"), std::string::npos);
-  EXPECT_NE(intent.reason.find("stage2_explore"), std::string::npos);
+  EXPECT_NE(intent.reason.find("stage2_hunt_last_seen"), std::string::npos);
 }
 
 TEST(Stage2Tactics, EarlyPhaseKeepsCollectingWhenResourcesVisible) {
@@ -626,18 +626,22 @@ TEST(Stage2Tactics, LlmFightStartsHuntingEarlier) {
   EXPECT_EQ(intent.action, "move");
   EXPECT_NE(intent.reason.find("stage2_hunt_last_seen"), std::string::npos);
 
+  // 不追旧记忆目标的策略（defend/avoid）作为对照：前期同样血量下不主动接敌
   TacticsFixture baseline;
   baseline.see_everything();
   baseline.add_robot("B", Cell{16, 12}, 100.0);
   baseline.advance_to(280);
   baseline.perception.entities.clear();
   baseline.advance_to(300);
+  baseline.events.strategy = "defend";
+  baseline.events.strategy_tick = 299;
   const Intent calm = rmtc_bot::stage2_decide(baseline.context());
   EXPECT_EQ(calm.reason.find("stage2_hunt_last_seen"), std::string::npos);
   EXPECT_NE(calm.action, "wait");
 }
 
-TEST(Stage2Tactics, LlmCollectDefersHunting) {
+TEST(Stage2Tactics, LlmCollectStillActsWithoutVisibleResource) {
+  // collect 只是把输出期推后；前期无资源可捡时仍必须行动，不允许空转
   TacticsFixture fixture;
   fixture.see_everything();
   fixture.events.strategy = "collect";
@@ -647,7 +651,6 @@ TEST(Stage2Tactics, LlmCollectDefersHunting) {
   fixture.perception.entities.clear();
   fixture.advance_to(345);
   const Intent intent = rmtc_bot::stage2_decide(fixture.context());
-  EXPECT_EQ(intent.reason.find("stage2_hunt_last_seen"), std::string::npos);
   EXPECT_NE(intent.action, "wait");
 }
 
@@ -900,10 +903,10 @@ TEST(Stage2Tactics, HitCountDropsOnDeathAndStopsAtZero) {
   EXPECT_EQ(fixture.events.hit_count(), 0);
 }
 
-TEST(Stage2Tactics, ConservativeStopsChasingAfterSixtyHits) {
+TEST(Stage2Tactics, ConservativeStopsChasingAfterSeventyHits) {
   TacticsFixture fixture;
-  // 反复“打一次 → 目标掉 20 血 → 回到 100”累计 60 次命中
-  for (int i = 0; i < 60; ++i) {
+  // 反复“打一次 → 目标掉 20 血 → 回到 100”累计 70 次命中
+  for (int i = 0; i < 70; ++i) {
     fixture.perception.entities.clear();
     fixture.add_robot("B", Cell{13, 12}, 100.0);
     fixture.advance_to(10 + 2 * i);
@@ -913,7 +916,7 @@ TEST(Stage2Tactics, ConservativeStopsChasingAfterSixtyHits) {
     fixture.advance_to(11 + 2 * i);
     rmtc_bot::stage2_decide(fixture.context());
   }
-  ASSERT_EQ(fixture.events.hit_count(), 60);
+  ASSERT_EQ(fixture.events.hit_count(), 70);
 
   // 保守期：血量不足以承受一次完整交火时不再主动追远距离敌人
   fixture.perception.entities.clear();
@@ -932,4 +935,28 @@ TEST(Stage2Tactics, ConservativeStopsChasingAfterSixtyHits) {
   baseline.advance_to(350);
   const Intent aggressive = rmtc_bot::stage2_decide(baseline.context());
   EXPECT_NE(aggressive.reason.find("stage2_hunt:B"), std::string::npos);
+}
+
+TEST(Stage2Tactics, PatrolKeepsWaypointInsteadOfOscillating) {
+  // 每 Tick 重挑“最远航点”会让对角航点翻转，车在四格里死循环；
+  // 航点粘滞后应沿同一方向持续走出去
+  TacticsFixture fixture;
+  fixture.see_everything();
+  rmtc_bot::CellSet visited;
+  rmtc_bot::Cell pos{9, 9};
+  for (int tick = 470; tick < 490; ++tick) {
+    fixture.perception.self.position = pos;
+    fixture.advance_to(tick);
+    const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+    ASSERT_EQ(intent.action, "move") << "tick=" << tick;
+    ASSERT_TRUE(intent.direction.has_value()) << "tick=" << tick;
+    for (const auto& direction : rmtc_bot::kDirections) {
+      if (direction.name == *intent.direction) {
+        pos = rmtc_bot::move_cell(pos, direction.name);
+        break;
+      }
+    }
+    visited.insert(pos);
+  }
+  EXPECT_GE(visited.size(), 14u);
 }

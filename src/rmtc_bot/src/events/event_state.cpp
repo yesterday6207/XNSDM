@@ -68,6 +68,8 @@ void EventState::reset() {
   default_reach_latched_ = false;
   chase_target_id_.clear();
   chase_tick_ = -1;
+  patrol_target_ = Cell{0, 0};
+  patrol_tick_ = -1;
   last_alive_ = false;
   has_alive_sample_ = false;
   enemy_hp_.clear();
@@ -372,6 +374,18 @@ std::optional<std::string> EventState::chase_target(int tick, int max_age) const
     return std::nullopt;
   }
   return chase_target_id_;
+}
+
+void EventState::note_patrol_target(const Cell& cell, int tick) {
+  patrol_target_ = cell;
+  patrol_tick_ = tick;
+}
+
+std::optional<Cell> EventState::patrol_target(int tick, int max_age) const {
+  if (patrol_tick_ < 0 || tick - patrol_tick_ > max_age) {
+    return std::nullopt;
+  }
+  return patrol_target_;
 }
 
 void EventState::note_attack(int tick) { attack_tick_ = tick; }

@@ -61,6 +61,11 @@ class EventState {
   void note_chase_target(const std::string& robot_id, int tick);
   std::optional<std::string> chase_target(int tick, int max_age = 10) const;
 
+  /// 粘住巡逻航点：每 Tick 重算“最远航点”会让目标在两个对角之间翻转，
+  /// 车会在四格之间死循环（用户反馈的“中间转圈”）。
+  void note_patrol_target(const Cell& cell, int tick);
+  std::optional<Cell> patrol_target(int tick, int max_age = 40) const;
+
   /// 参配默认到达点（非协议明确坐标）已接近一次，本场不再回头踩点。
   void latch_default_reach() { default_reach_latched_ = true; }
   bool default_reach_latched() const { return default_reach_latched_; }
@@ -74,7 +79,7 @@ class EventState {
                       const std::vector<std::pair<std::string, double>>& enemies);
   int hit_count() const { return hit_count_; }
   /// 累计命中达到该值后转入保守策略，避免为继续进攻送命而回吐有效伤害。
-  static constexpr int kConservativeHitCount = 60;
+  static constexpr int kConservativeHitCount = 70;
   static constexpr int kDeathHitPenalty = 6;
   bool conservative_combat() const { return hit_count_ >= kConservativeHitCount; }
 
@@ -99,6 +104,8 @@ class EventState {
   bool default_reach_latched_ = false;
   std::string chase_target_id_;
   int chase_tick_ = -1;
+  Cell patrol_target_{0, 0};
+  int patrol_tick_ = -1;
   bool last_alive_ = false;
   bool has_alive_sample_ = false;
   std::unordered_map<std::string, double> enemy_hp_;

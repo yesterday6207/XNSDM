@@ -29,8 +29,8 @@ constexpr int kLlmLateHunt = 40;
 constexpr int kLlmLatePickupDistance = 6;
 constexpr double kLlmDefendBonus = 10.0;
 constexpr double kLlmHealBonus = 15.0;
-/// 前期换血门槛：资源价值高于一次普通攻击，血量不健康时不接战。
-constexpr double kEarlyTradeHp = 70.0;
+/// 前期换血门槛：血量还扛得住一次交火就主动接战，宁打不绕。
+constexpr double kEarlyTradeHp = 50.0;
 /// 撤离时把最近见过的敌人也当作威胁，避免离开视野后立刻折返。
 constexpr int kThreatMemoryTicks = 6;
 /// 普通攻击单次伤害；潘潘的神易伤期间翻倍，防御时减半。
@@ -38,6 +38,8 @@ constexpr double kNormalHit = 20.0;
 constexpr double kVulnerableHit = 40.0;
 /// 巡逻避开最近该 Tick 数内走过的格，防止在几格之间循环空耗输出机会。
 constexpr int kPatrolTabuTicks = 24;
+/// 巡逻航点粘滞：锁定一个航点后沿路程单调缩短地走，到达或超时才换下一个。
+constexpr int kPatrolWaypointTicks = 40;
 /// 资源计分满分门槛：资源价值达到该值后继续采集不再加分。
 constexpr double kResourceScoreFullValue = 120.0;
 /// 保守期把防御阈值抬高，让车更早转入防御/撤离而不是继续换血。
@@ -448,8 +450,10 @@ std::string opposite_direction(const std::string& direction) {
   return "";
 }
 
-/// 无敌人、无可收集资源时的巡逻：轮流前往四个象限，保证持续移动。
+/// 无敌人、无可收集资源时的巡逻：锁定一个象限航点后一路走过去，到达/超时才换。
 /// 不把场地中心当航点：中心正是世界分裂十字线交点，停留越久越容易被秒杀。
+/// 航点必须粘滞：每 Tick 重新挑“最远航点”会在两个对角之间翻转，
+/// 车会在 (9,9)→(9,8)→(8,8)→(8,9) 这样的四格里死循环（即“场地中间转圈”）。
 /// 每步都必须缩短到当前航点的 BFS 距离，并在两 Tick 内避免原路折返，
 /// 否则决策会与追击交替选中相反方向，导致相邻两格之间来回振荡。
 std::optional<Intent> patrol_step(const DecisionContext& ctx, const BlockedFn& blocked,
@@ -466,27 +470,37 @@ std::optional<Intent> patrol_step(const DecisionContext& ctx, const BlockedFn& b
   const auto last = ctx.events.last_move_direction(ctx.tick);
   const std::string reverse = last.has_value() ? opposite_direction(*last) : std::string();
 
-  // 始终前往当前最远的航点：路程单调缩短，天然形成跨图巡回，
-  // 不会像按 Tick 轮换航点那样在两点之间来回拉扯
   const CellIntMap from_pos = bfs_distances(pos, width, height, blocked, extra);
   std::optional<Cell> target;
-  int farthest = -1;
-  for (const auto& waypoint : waypoints) {
-    if (!ctx.grid.in_bounds(waypoint) || waypoint == pos || blocked(waypoint)) {
-      continue;
-    }
-    const auto found = from_pos.find(waypoint);
-    if (found == from_pos.end() || found->second == 0) {
-      continue;
-    }
-    if (found->second > farthest) {
-      farthest = found->second;
-      target = waypoint;
+  // 先沿用已锁定的航点，保证路程单调缩短；只有它已到达、超时或变得不可达才重挑
+  if (const auto latched = ctx.events.patrol_target(ctx.tick, kPatrolWaypointTicks);
+      latched.has_value() && *latched != pos && !blocked(*latched)) {
+    const auto found = from_pos.find(*latched);
+    if (found != from_pos.end() && found->second > 0) {
+      target = *latched;
     }
   }
   if (!target.has_value()) {
-    return std::nullopt;
+    // 没有锁定航点时挑当前最远的象限航点，形成跨图巡回而不是原地震荡
+    int farthest = -1;
+    for (const auto& waypoint : waypoints) {
+      if (!ctx.grid.in_bounds(waypoint) || waypoint == pos || blocked(waypoint)) {
+        continue;
+      }
+      const auto found = from_pos.find(waypoint);
+      if (found == from_pos.end() || found->second == 0) {
+        continue;
+      }
+      if (found->second > farthest) {
+        farthest = found->second;
+        target = waypoint;
+      }
+    }
+    if (!target.has_value()) {
+      return std::nullopt;
+    }
   }
+  ctx.events.note_patrol_target(*target, ctx.tick);
 
   const CellIntMap distances = bfs_distances(*target, width, height, blocked, extra);
   const auto here = distances.find(pos);
@@ -704,7 +718,9 @@ Intent decide_stage2(const DecisionContext& ctx) {
 
   // 血量不健康时不再把落点选在敌人横纵射程内：进攻也要留活路，
   // 否则移动过去只是把下一次阵亡提前 60 点有效伤害。
-  const bool avoid_enemy_line = hp <= defend_hp;
+  // 阈值下调为“再吃一次攻击就会低于防御线”，只在真正危险时让路，
+  // 避免中血时全图都是禁区、被迫在场地中间绕圈。
+  const bool avoid_enemy_line = hp <= defend_hp - incoming_hit;
   const BlockedFn blocked = [&ctx, tick, enemies, max_range, avoid_enemy_line](const Cell& cell) {
     if (ctx.grid.is_blocked(cell, tick)) {
       return true;
@@ -900,8 +916,9 @@ Intent decide_stage2(const DecisionContext& ctx) {
         }
       }
     }
-    // LLM 要求输出时优先接近敌人，而不是先把探索走完；残血或保守期不主动接敌
-    if (llm_fight && !conservative && hp > defend_hp) {
+    // 没有资源可抢时先主动找敌人打，而不是把 Tick 花在跨图巡逻上；
+    // 只有血量低于防御线、LLM 要求避战或已进入保守期（累计命中 ≥ 70）才放弃主动接敌。
+    if (!conservative && !llm_defend && hp > defend_hp) {
       if (const auto chase = chase_step(ctx, enemies, blocked, extra, true);
           chase.has_value()) {
         return *chase;
