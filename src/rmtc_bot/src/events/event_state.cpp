@@ -23,6 +23,9 @@ bool area_contains(const std::optional<Area>& area, const Cell& cell) {
          cell.second <= area->y2;
 }
 
+/// 世界分裂激活前多少 Tick 就视为整行整列危险；留出走到线外的时间。
+constexpr int kWorldSplitEscapeTicks = 5;
+
 /// 潘潘的神触发窗口占事件时长的比例；正式规则为前 20/30 Tick。
 constexpr int kPanpanTriggerNumerator = 2;
 constexpr int kPanpanTriggerDenominator = 3;
@@ -59,6 +62,15 @@ void EventState::reset() {
   vulnerable_from_ = -1;
   vulnerable_until_ = -1;
   visited_.clear();
+  hit_count_ = 0;
+  attack_tick_ = -1;
+  observed_tick_ = -1;
+  default_reach_latched_ = false;
+  chase_target_id_.clear();
+  chase_tick_ = -1;
+  last_alive_ = false;
+  has_alive_sample_ = false;
+  enemy_hp_.clear();
 }
 
 void EventState::apply(const LLMDecision& decision, int now_tick, GridMap* grid_map) {
@@ -215,9 +227,10 @@ bool EventState::is_cell_risky(const Cell& cell, int tick, bool protected_self) 
       if (!event.point.has_value() || !event.active_from.has_value()) {
         continue;
       }
-      // 世界分裂会直接击毁线上的战车：公告后提前 2 Tick 就避开整行整列
+      // 世界分裂会直接击毁线上的战车：提前离开整行整列。
+      // 走到线外最多需要数格，只提前 2 Tick 经常来不及，因此放宽到 5 Tick。
       const int delta = *event.active_from - tick;
-      if (0 <= delta && delta <= 2 &&
+      if (0 <= delta && delta <= kWorldSplitEscapeTicks &&
           (cell.first == event.point->first || cell.second == event.point->second)) {
         return true;
       }
@@ -347,6 +360,53 @@ void EventState::note_visited(int tick, const Cell& cell) {
                                   return tick - entry.first > kKeepTicks;
                                 }),
                  visited_.end());
+}
+
+void EventState::note_chase_target(const std::string& robot_id, int tick) {
+  chase_target_id_ = robot_id;
+  chase_tick_ = tick;
+}
+
+std::optional<std::string> EventState::chase_target(int tick, int max_age) const {
+  if (chase_tick_ < 0 || chase_target_id_.empty() || tick - chase_tick_ > max_age) {
+    return std::nullopt;
+  }
+  return chase_target_id_;
+}
+
+void EventState::note_attack(int tick) { attack_tick_ = tick; }
+
+void EventState::observe_combat(
+    int tick, bool alive, const std::vector<std::pair<std::string, double>>& enemies) {
+  // 同一 Tick 只结算一次，重发/重复决策不会重复计数
+  if (observed_tick_ == tick) {
+    return;
+  }
+  observed_tick_ = tick;
+
+  if (has_alive_sample_ && last_alive_ && !alive) {
+    hit_count_ = std::max(0, hit_count_ - kDeathHitPenalty);
+  }
+  last_alive_ = alive;
+  has_alive_sample_ = true;
+
+  // 攻击在当 Tick 的战斗阶段结算，下一 Tick 才能在感知里看到目标掉血；
+  // 留一格余量吸收感知延迟，同一次掉血不会被重复统计（第二次差值已为 0）。
+  const bool attacked_recently = attack_tick_ >= 0 && tick - attack_tick_ >= 1 &&
+                                 tick - attack_tick_ <= 2;
+  if (attacked_recently) {
+    for (const auto& entry : enemies) {
+      const auto previous = enemy_hp_.find(entry.first);
+      if (previous != enemy_hp_.end() && previous->second > entry.second) {
+        hit_count_ += 1;
+      }
+    }
+  }
+
+  enemy_hp_.clear();
+  for (const auto& entry : enemies) {
+    enemy_hp_[entry.first] = entry.second;
+  }
 }
 
 bool EventState::recently_visited(const Cell& cell, int tick, int max_age) const {

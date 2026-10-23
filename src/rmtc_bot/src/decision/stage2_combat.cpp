@@ -40,9 +40,34 @@ constexpr double kVulnerableHit = 40.0;
 constexpr int kPatrolTabuTicks = 24;
 /// 资源计分满分门槛：资源价值达到该值后继续采集不再加分。
 constexpr double kResourceScoreFullValue = 120.0;
+/// 保守期把防御阈值抬高，让车更早转入防御/撤离而不是继续换血。
+constexpr double kConservativeDefendBonus = 15.0;
 
+/// 到达任务点。协议给出明确坐标时严格按坐标执行；
+/// 只有自然语言任务、使用参配默认到达点时放宽为“相邻即算到达并锁定”，
+/// 否则车会为了踩默认点（常常正好是场地中心十字线）反复折返，正中世界分裂的火线。
 std::optional<Cell> reach_target(const DecisionContext& ctx) {
-  return ctx.missions.reach_target(ctx.planning.stage2_reach_target);
+  const auto target = ctx.missions.reach_target(ctx.planning.stage2_reach_target);
+  if (!target.has_value()) {
+    return target;
+  }
+  const bool has_explicit_position =
+      std::any_of(ctx.missions.missions.begin(), ctx.missions.missions.end(),
+                  [](const Mission& mission) {
+                    return mission.type == "reach" && mission.position.has_value();
+                  });
+  if (has_explicit_position) {
+    return target;
+  }
+  if (ctx.events.default_reach_latched()) {
+    return std::nullopt;
+  }
+  const Cell pos = ctx.state.position;
+  if (std::abs(pos.first - target->first) <= 1 && std::abs(pos.second - target->second) <= 1) {
+    ctx.events.latch_default_reach();
+    return std::nullopt;
+  }
+  return target;
 }
 
 int manhattan(const Cell& lhs, const Cell& rhs) {
@@ -324,20 +349,36 @@ std::optional<Intent> chase_step(const DecisionContext& ctx,
   if (!allow_memory) {
     return std::nullopt;
   }
+  // 旧记忆的平均遍历顺序不稳定：多个目标交替选中会让车在两格之间来回抖动，
+  // 因此先粘住上一 Tick 的追击目标，直到记忆过期或到达仍未见人再换。
+  const auto latched = ctx.events.chase_target(ctx.tick);
   const auto remembered = ctx.tracker.remembered_enemies(ctx.tick, memory);
+  std::vector<const EnemyTrack*> ordered;
   for (const auto& enemy : remembered) {
     const bool still_visible =
         std::any_of(enemies.begin(), enemies.end(), [&enemy](const EnemyTrack& visible) {
           return visible.robot_id == enemy.robot_id;
         });
-    if (!still_visible && (enemy.position == pos || manhattan(pos, enemy.position) <= 1)) {
+    if (!still_visible) {
+      ordered.push_back(&enemy);
+    }
+  }
+  std::stable_sort(ordered.begin(), ordered.end(),
+                   [&latched](const EnemyTrack* lhs, const EnemyTrack* rhs) {
+                     const bool lhs_latched = latched.has_value() && lhs->robot_id == *latched;
+                     const bool rhs_latched = latched.has_value() && rhs->robot_id == *latched;
+                     return lhs_latched && !rhs_latched;
+                   });
+  for (const auto* enemy : ordered) {
+    if (enemy->position == pos || manhattan(pos, enemy->position) <= 1) {
       // 到了旧位置仍未遇见：目标已离开，丢弃记忆，避免下一步又被旧目标拉回
-      ctx.tracker.forget_enemy(enemy.robot_id);
+      ctx.tracker.forget_enemy(enemy->robot_id);
       continue;
     }
-    if (const auto step = step_toward(ctx, enemy.position, distances, blocked, extra);
+    if (const auto step = step_toward(ctx, enemy->position, distances, blocked, extra);
         step.has_value()) {
-      return Intent("move", step, "stage2_hunt_last_seen:" + enemy.robot_id);
+      ctx.events.note_chase_target(enemy->robot_id, ctx.tick);
+      return Intent("move", step, "stage2_hunt_last_seen:" + enemy->robot_id);
     }
   }
   return std::nullopt;
@@ -407,7 +448,8 @@ std::string opposite_direction(const std::string& direction) {
   return "";
 }
 
-/// 无敌人、无可收集资源时的巡逻：轮流前往中心与四个象限，保证持续移动。
+/// 无敌人、无可收集资源时的巡逻：轮流前往四个象限，保证持续移动。
+/// 不把场地中心当航点：中心正是世界分裂十字线交点，停留越久越容易被秒杀。
 /// 每步都必须缩短到当前航点的 BFS 距离，并在两 Tick 内避免原路折返，
 /// 否则决策会与追击交替选中相反方向，导致相邻两格之间来回振荡。
 std::optional<Intent> patrol_step(const DecisionContext& ctx, const BlockedFn& blocked,
@@ -416,7 +458,6 @@ std::optional<Intent> patrol_step(const DecisionContext& ctx, const BlockedFn& b
   const int height = ctx.state.map_height;
   const Cell pos = ctx.state.position;
   const std::vector<Cell> waypoints{
-      {width / 2, height / 2},
       {width / 4, height / 4},
       {width / 4, height * 3 / 4},
       {width * 3 / 4, height / 4},
@@ -452,8 +493,30 @@ std::optional<Intent> patrol_step(const DecisionContext& ctx, const BlockedFn& b
   if (here == distances.end() || here->second == 0) {
     return std::nullopt;
   }
+  // 中心十字线（世界分裂的攻击线）上只做短暂穿越，不在其上停留或来回走
+  const auto on_center_cross = [width, height](const Cell& cell) {
+    return cell.first == width / 2 || cell.second == height / 2;
+  };
+  // 站在中心线上时优先横向离开：此处离任一角航点常只有沿线的方向能缩短距离，
+  // 若坚持“每步都缩短距离”，车就会被锁在十字线上反复走位，正好撞进世界分裂
+  if (on_center_cross(pos)) {
+    for (const auto& direction : kDirections) {
+      if (!reverse.empty() && direction.name == reverse) {
+        continue;
+      }
+      const Cell cell = move_cell(pos, direction.name);
+      if (on_center_cross(cell) || !legal_cell(ctx, cell, blocked, extra)) {
+        continue;
+      }
+      if (ctx.events.recently_visited(cell, ctx.tick, kPatrolTabuTicks)) {
+        continue;
+      }
+      return Intent("move", std::string(direction.name), "stage2_patrol");
+    }
+  }
   std::optional<std::string> forward;
   std::optional<std::string> fresh;   // 最近没走过的前进方向
+  std::optional<std::string> fresh_off_cross;  // 既没走过又能离开中心线
   std::optional<std::string> backward;
   for (const auto& direction : kDirections) {
     const Cell cell = move_cell(pos, direction.name);
@@ -471,12 +534,19 @@ std::optional<Intent> patrol_step(const DecisionContext& ctx, const BlockedFn& b
     if (!forward.has_value()) {
       forward = std::string(direction.name);
     }
-    if (!ctx.events.recently_visited(cell, ctx.tick, kPatrolTabuTicks)) {
-      fresh = std::string(direction.name);
+    if (ctx.events.recently_visited(cell, ctx.tick, kPatrolTabuTicks)) {
+      continue;
+    }
+    fresh = std::string(direction.name);
+    if (!on_center_cross(cell)) {
+      fresh_off_cross = std::string(direction.name);
       break;
     }
   }
-  // 优先没走过的格：只靠“禁止原路折返”仍会在四格之间循环
+  // 优先没走过、且能离开中心十字线的格：只靠“禁止原路折返”仍会在四格之间循环
+  if (fresh_off_cross.has_value()) {
+    return Intent("move", *fresh_off_cross, "stage2_patrol");
+  }
   if (fresh.has_value()) {
     return Intent("move", *fresh, "stage2_patrol");
   }
@@ -527,9 +597,19 @@ Intent decide_stage2(const DecisionContext& ctx);
 }  // namespace
 
 Intent stage2_decide(const DecisionContext& ctx) {
+  // 先用本 Tick 感知结算上一 Tick 的攻击命中与自身死亡，供保守策略判断
+  std::vector<std::pair<std::string, double>> visible;
+  for (const auto& enemy : ctx.tracker.visible_enemies(ctx.perception)) {
+    visible.emplace_back(enemy.robot_id, enemy.hp);
+  }
+  ctx.events.observe_combat(ctx.tick, ctx.perception.self.alive, visible);
+
   const Intent intent = decide_stage2(ctx);
   if (intent.action == "move" && intent.direction.has_value()) {
     ctx.events.note_move(ctx.tick, *intent.direction);
+  }
+  if (intent.action == "attack") {
+    ctx.events.note_attack(ctx.tick);
   }
   return intent;
 }
@@ -572,7 +652,13 @@ Intent decide_stage2(const DecisionContext& ctx) {
   const bool late_phase = tick >= hunt_start || economy_done;
   const int late_pickup = llm_collect ? kLlmLatePickupDistance : kLatePickupDistance;
 
+  // 累计命中达到 60 后进入保守期：有效伤害已经拿满对抗分，
+  // 此后每死一次都会扣 60 并等待 3 Tick，继续换血只会回吐得分。
+  const bool conservative = ctx.events.conservative_combat();
   double defend_hp = ctx.planning.defend_hp_threshold + (llm_defend ? kLlmDefendBonus : 0.0);
+  if (conservative) {
+    defend_hp += kConservativeDefendBonus;
+  }
   // 潘潘的神易伤：自身受到普通攻击 40 HP、防御时 20 HP，需更早转入防御/撤离
   const bool self_vulnerable = ctx.events.self_vulnerable(tick);
   if (self_vulnerable) {
@@ -616,14 +702,34 @@ Intent decide_stage2(const DecisionContext& ctx) {
   const bool buff_ready =
       ctx.events.fortress_buff_ready(ctx.planning.fortress_stay_ticks);
 
-  const BlockedFn blocked = [&ctx, tick, hp](const Cell& cell) {
+  // 血量不健康时不再把落点选在敌人横纵射程内：进攻也要留活路，
+  // 否则移动过去只是把下一次阵亡提前 60 点有效伤害。
+  const bool avoid_enemy_line = hp <= defend_hp;
+  const BlockedFn blocked = [&ctx, tick, enemies, max_range, avoid_enemy_line](const Cell& cell) {
     if (ctx.grid.is_blocked(cell, tick)) {
       return true;
     }
     if (ctx.events.is_cell_blocked(cell, tick)) {
       return true;
     }
-    return ctx.events.is_cell_risky(cell, tick, ctx.state.protected_);
+    if (ctx.events.is_cell_risky(cell, tick, ctx.state.protected_)) {
+      return true;
+    }
+    if (!avoid_enemy_line) {
+      return false;
+    }
+    for (const auto& enemy : enemies) {
+      if (enemy.hp <= 0 || enemy.protected_) {
+        continue;
+      }
+      const int dx = std::abs(enemy.position.first - cell.first);
+      const int dy = std::abs(enemy.position.second - cell.second);
+      if ((dx == 0 && dy >= 1 && dy <= max_range) ||
+          (dy == 0 && dx >= 1 && dx <= max_range)) {
+        return true;
+      }
+    }
+    return false;
   };
 
   CellSet extra;
@@ -677,7 +783,8 @@ Intent decide_stage2(const DecisionContext& ctx) {
     return Intent("defend", std::nullopt, "stage2_defend_focus");
   }
   if (attack.has_value() && state.can_attack(ctx.stage)) {
-    const bool safe_to_trade = hp > incoming_hit;
+    // 保守期要求扛得住本 Tick 全部同线伤害才继续输出，不再只看单次攻击
+    const bool safe_to_trade = conservative ? hp > defend_hp + hit : hp > incoming_hit;
     const bool healthy = hp > (late_phase ? defend_hp : kEarlyTradeHp);
     const bool late_aggressive = late_phase && safe_to_trade;
     const bool early_self_defense = !late_phase && attack->distance <= 1;
@@ -793,8 +900,8 @@ Intent decide_stage2(const DecisionContext& ctx) {
         }
       }
     }
-    // LLM 要求输出时优先接近敌人，而不是先把探索走完；残血时不主动接敌
-    if (llm_fight && hp > defend_hp) {
+    // LLM 要求输出时优先接近敌人，而不是先把探索走完；残血或保守期不主动接敌
+    if (llm_fight && !conservative && hp > defend_hp) {
       if (const auto chase = chase_step(ctx, enemies, blocked, extra, true);
           chase.has_value()) {
         return *chase;
@@ -833,9 +940,11 @@ Intent decide_stage2(const DecisionContext& ctx) {
         choice->distance <= late_pickup) {
       return Intent("move", choice->step, "stage2_resource:" + choice->resource_id);
     }
-    // 残血时以保命为先，不再主动追击
-    if (hp > defend_hp) {
-      if (const auto chase = chase_step(ctx, enemies, blocked, extra, !llm_defend);
+    // 残血时以保命为先，不再主动追击；保守期只追视野内目标，不追旧记忆
+    const double chase_hp = defend_hp + (conservative ? incoming_hit : 0.0);
+    if (hp > chase_hp) {
+      if (const auto chase = chase_step(ctx, enemies, blocked, extra,
+                                        !llm_defend && !conservative);
           chase.has_value()) {
         return *chase;
       }

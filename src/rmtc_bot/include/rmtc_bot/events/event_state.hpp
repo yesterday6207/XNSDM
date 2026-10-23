@@ -2,6 +2,8 @@
 
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "rmtc_bot/ai/output_validator.hpp"
@@ -54,6 +56,28 @@ class EventState {
   /// 记录本 Tick 所在格，用于巡逻时避开刚走过的区域（防止小范围绕圈）。
   void note_visited(int tick, const Cell& cell);
   bool recently_visited(const Cell& cell, int tick, int max_age) const;
+
+  /// 粘住追击目标：多个旧记忆交替选中会让车在两格之间来回抖动、空耗输出 Tick。
+  void note_chase_target(const std::string& robot_id, int tick);
+  std::optional<std::string> chase_target(int tick, int max_age = 10) const;
+
+  /// 参配默认到达点（非协议明确坐标）已接近一次，本场不再回头踩点。
+  void latch_default_reach() { default_reach_latched_ = true; }
+  bool default_reach_latched() const { return default_reach_latched_; }
+
+  /// 记录本 Tick 提交了攻击，下一 Tick 用它确认是否真的命中。
+  void note_attack(int tick);
+  /// 用感知到的敌人血量与自身存活情况更新命中计数：
+  /// 上一 Tick 攻击命中一个目标 +1，本 Tick 阵亡 -6（最低 0）。
+  /// enemies 为 (robot_id, hp) 的当前可见快照。
+  void observe_combat(int tick, bool alive,
+                      const std::vector<std::pair<std::string, double>>& enemies);
+  int hit_count() const { return hit_count_; }
+  /// 累计命中达到该值后转入保守策略，避免为继续进攻送命而回吐有效伤害。
+  static constexpr int kConservativeHitCount = 60;
+  static constexpr int kDeathHitPenalty = 6;
+  bool conservative_combat() const { return hit_count_ >= kConservativeHitCount; }
+
   std::string describe() const;
 
   std::vector<TimedEvent> events;
@@ -69,6 +93,15 @@ class EventState {
   int vulnerable_from_ = -1;
   int vulnerable_until_ = -1;
   std::vector<std::pair<int, Cell>> visited_;
+  int hit_count_ = 0;
+  int attack_tick_ = -1;
+  int observed_tick_ = -1;
+  bool default_reach_latched_ = false;
+  std::string chase_target_id_;
+  int chase_tick_ = -1;
+  bool last_alive_ = false;
+  bool has_alive_sample_ = false;
+  std::unordered_map<std::string, double> enemy_hp_;
 };
 
 }  // namespace rmtc_bot

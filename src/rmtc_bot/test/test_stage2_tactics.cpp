@@ -845,3 +845,91 @@ TEST(Stage2Tactics, PatrolDoesNotLoopInSmallArea) {
   }
   EXPECT_GE(visited.size(), 8u);
 }
+
+TEST(Stage2Tactics, PatrolPrefersLeavingCenterCross) {
+  // 中心行/列是世界分裂的攻击线：巡逻在同等前进方向间应优先离开中心线
+  TacticsFixture fixture;
+  fixture.see_everything();
+  fixture.perception.self.position = Cell{12, 13};
+  fixture.advance_to(470);
+  const Intent intent = rmtc_bot::stage2_decide(fixture.context());
+  ASSERT_EQ(intent.action, "move");
+  ASSERT_TRUE(intent.direction.has_value());
+  EXPECT_NE(*intent.direction, "up");
+}
+
+TEST(Stage2Tactics, HitCountIncrementsWhenEnemyLosesHp) {
+  // 上一 Tick 攻击、本 Tick 感知到目标掉血，记一次成功命中
+  TacticsFixture fixture;
+  fixture.add_robot("B", Cell{13, 12}, 100.0);
+  fixture.advance_to(10);
+  ASSERT_EQ(rmtc_bot::stage2_decide(fixture.context()).action, "attack");
+  fixture.perception.entities.clear();
+  fixture.add_robot("B", Cell{13, 12}, 80.0);
+  fixture.advance_to(11);
+  rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(fixture.events.hit_count(), 1);
+
+  // 重复同一帧不会重复计数
+  rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(fixture.events.hit_count(), 1);
+}
+
+TEST(Stage2Tactics, HitCountDropsOnDeathAndStopsAtZero) {
+  // 阵亡一次扣 6 次命中，累计不足 6 时只降到 0，不出现负值
+  TacticsFixture fixture;
+  fixture.add_robot("B", Cell{13, 12}, 100.0);
+  fixture.advance_to(10);
+  ASSERT_EQ(rmtc_bot::stage2_decide(fixture.context()).action, "attack");
+  fixture.perception.entities.clear();
+  fixture.add_robot("B", Cell{13, 12}, 80.0);
+  fixture.advance_to(11);
+  rmtc_bot::stage2_decide(fixture.context());
+  ASSERT_EQ(fixture.events.hit_count(), 1);
+
+  fixture.perception.self.alive = false;
+  fixture.perception.self.hp = 0.0;
+  fixture.perception.entities.clear();
+  fixture.advance_to(12);
+  rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(fixture.events.hit_count(), 0);
+
+  fixture.perception.self.alive = false;
+  fixture.advance_to(13);
+  rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(fixture.events.hit_count(), 0);
+}
+
+TEST(Stage2Tactics, ConservativeStopsChasingAfterSixtyHits) {
+  TacticsFixture fixture;
+  // 反复“打一次 → 目标掉 20 血 → 回到 100”累计 60 次命中
+  for (int i = 0; i < 60; ++i) {
+    fixture.perception.entities.clear();
+    fixture.add_robot("B", Cell{13, 12}, 100.0);
+    fixture.advance_to(10 + 2 * i);
+    ASSERT_EQ(rmtc_bot::stage2_decide(fixture.context()).action, "attack") << "i=" << i;
+    fixture.perception.entities.clear();
+    fixture.add_robot("B", Cell{13, 12}, 80.0);
+    fixture.advance_to(11 + 2 * i);
+    rmtc_bot::stage2_decide(fixture.context());
+  }
+  ASSERT_EQ(fixture.events.hit_count(), 60);
+
+  // 保守期：血量不足以承受一次完整交火时不再主动追远距离敌人
+  fixture.perception.entities.clear();
+  fixture.perception.self.hp = 55.0;
+  fixture.add_robot("B", Cell{16, 12}, 100.0);
+  fixture.advance_to(350);
+  const Intent conservative = rmtc_bot::stage2_decide(fixture.context());
+  EXPECT_EQ(conservative.reason.find("stage2_hunt:B"), std::string::npos);
+
+  // 同样血量、未进入保守期时仍应主动接近输出
+  TacticsFixture baseline;
+  baseline.see_everything();
+  baseline.perception.self.position = Cell{12, 12};
+  baseline.perception.self.hp = 55.0;
+  baseline.add_robot("B", Cell{16, 12}, 100.0);
+  baseline.advance_to(350);
+  const Intent aggressive = rmtc_bot::stage2_decide(baseline.context());
+  EXPECT_NE(aggressive.reason.find("stage2_hunt:B"), std::string::npos);
+}

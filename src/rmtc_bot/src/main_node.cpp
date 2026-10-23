@@ -323,6 +323,7 @@ void RmtcBotNode::on_perception(const std_msgs::msg::String::SharedPtr msg) {
                    " pos=", cell_to_string(perception.self.position),
                    " hp=", static_cast<int>(perception.self.hp),
                    " alive=", perception.self.alive ? "true" : "false",
+                   " hit=", events_.hit_count(),
                    " type=", decision_type_, " sent=", sent ? "true" : "false"));
 }
 
